@@ -1,0 +1,12 @@
+.DS_Store
+
+# Node / frontend artifacts
+node_modules/
+frontend/dist/
+
+# DFX / Motoko local artifacts
+.dfx/
+.mops/
+src/declarations/
+.env
+
