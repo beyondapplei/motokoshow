@@ -1,62 +1,78 @@
-# Motoko Show
+# Motoko VetKD Demo
 
-一个用于展示 Motoko 能力的 ICP 示例工程。  
-后端使用 Motoko canister，前端使用 React + Vite。
+一个基于 ICP 的 VetKD 演示工程：后端使用 Motoko，前端使用 React + Vite。
 
-## 功能说明
+## 当前功能
 
-当前前端主界面已实现以下能力：
+当前页面只保留两个核心功能入口（主页点击后全屏打开）：
 
-1. 科技感视觉风格：动态背景、发光边框、HUD 风格卡片与按钮动效。
-2. 横向滑动能力列表：通过滑动或左右按钮浏览 Motoko 能力卡片。
-3. 中英文切换：右上角 `中 / EN` 一键切换页面文案。
-4. 右上角登录按钮：支持演示态登录（访客登录/退出），后续可接 Internet Identity。
+1. A 发密文给 B（VetKD + IBE）
+- A 登录后填写 B 的 Principal 和明文，点击加密生成 JSON 密文。
+- B 登录后粘贴密文，点击解密查看原文。
+- 解密时会校验当前登录身份必须等于密文目标 `recipientPrincipal`。
 
-## 技术栈
+2. A 发文字，B 按 A Principal 验签（WebCrypto Ed25519）
+- A 侧生成 Ed25519 签名。
+- B 侧根据公钥验签，并校验公钥推导的 Principal 与 A 的 Principal 一致。
 
-- Backend: [Motoko](https://internetcomputer.org/docs/motoko/main/getting-started/motoko-introduction)
-- Frontend: React 18 + Vite 5
-- Canister orchestration: dfx
+## 登录规则（Internet Identity）
+
+前端会根据环境自动选择 II provider：
+
+- `DFX_NETWORK=ic`：使用生产 II
+  - `https://identity.ic0.app/#authorize`
+- 其他网络（如 local）：使用本地 II
+  - `http://<CANISTER_ID_INTERNET_IDENTITY>.localhost:4943/#authorize`
+
+如果是本地网络但未配置 `CANISTER_ID_INTERNET_IDENTITY`，页面会提示登录配置缺失。
+
+## 后端接口（Motoko）
+
+`backend/app.mo` 当前暴露以下接口：
+
+- `vetkdPublicKeyExample(keyName, contextLabel)`
+  - 读取 VetKD 派生公钥（hex）
+- `vetkdDeriveKeyExample(transportPublicKey, keyName, contextLabel)`
+  - 派生加密密钥（hex）
+  - 派生输入绑定为 `caller`（`Principal.toBlob(caller)`）
+- `vetkdCallerInputHex()`
+  - 返回当前调用方 principal bytes 的 hex
 
 ## 项目结构
 
-- `backend/app.mo`: Motoko canister 逻辑
-- `frontend/src/App.jsx`: React 主界面与交互
-- `frontend/src/styles.css`: 前端样式（科技感主题）
-- `frontend/vite.config.js`: 前端构建配置
-- `dfx.json`: canister 配置
+- `backend/app.mo`：Motoko 后端（VetKD 逻辑）
+- `frontend/src/App.jsx`：前端主页面与交互
+- `frontend/src/styles.css`：前端样式
+- `frontend/vite.config.js`：Vite 配置
+- `dfx.json`：canister 配置
 
 ## 本地开发
 
-1. 安装依赖：
+1. 安装依赖
 
 ```bash
 npm install
 ```
 
-2. 启动本地 replica：
+2. 构建前端
+
+```bash
+npm run build --workspace frontend
+```
+
+3. 启动/部署 canister（按你的开发流程执行）
 
 ```bash
 dfx start --background
-```
-
-3. 本地部署 canister：
-
-```bash
 dfx deploy
 ```
 
-4. 启动前端开发服务：
+## 依赖说明
 
-```bash
-npm run dev --workspace frontend
-```
+前端关键依赖：
 
-## 生产构建与部署
+- `@dfinity/auth-client`
+- `@dfinity/agent`
+- `@dfinity/vetkeys`
 
-```bash
-npm run build
-dfx deploy --network ic
-```
-
-更多环境准备步骤可参考 `BUILD.md`。
+VetKD 与 AuthClient 均采用本地依赖打包，不再依赖 CDN 动态加载。
