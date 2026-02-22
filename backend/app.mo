@@ -1,6 +1,7 @@
 import Array "mo:base/Array"; // 引入数组工具，保留旧稳定变量类型时会用到。
 import Blob "mo:base/Blob"; // 引入 Blob 工具，用于二进制和文本编码。
 import Error "mo:base/Error"; // 引入 Error，用于捕获并返回系统调用错误信息。
+import ExperimentalCycles "mo:base/ExperimentalCycles"; // 引入 cycles 工具，用于给管理 canister 调用附加 cycles。
 import Nat8 "mo:base/Nat8"; // 引入 Nat8，用于字节转十六进制。
 import Principal "mo:base/Principal"; // 引入 Principal，用于 caller 身份和输入绑定。
 import Text "mo:base/Text"; // 引入 Text，用于字符串处理。
@@ -88,7 +89,7 @@ persistent actor MotokoShowcase { // 定义持久化 actor，保证变量跨升�
   let ic00 : actor { // 绑定管理 canister（aaaaa-aa）的 VetKD 接口。
     sign_with_schnorr : shared SignWithSchnorrArgs -> async SignWithSchnorrResult; // 兼容保留：旧版本稳定类型中的 Schnorr 签名接口字段。
     vetkd_public_key : shared query VetKDPublicKeyArgs -> async VetKDPublicKeyResult; // 声明获取 VetKD 公钥接口。
-    vetkd_derive_key : shared query VetKDDeriveKeyArgs -> async VetKDDeriveKeyResult; // 声明派生加密密钥接口。
+    vetkd_derive_key : shared query VetKDDeriveKeyArgs -> async VetKDDeriveKeyResult; // 保持旧稳定类型：派生加密密钥接口（query 声明用于兼容）。
   } = actor ("aaaaa-aa"); // 完成管理 canister actor 绑定。
 
   // ---- 以下变量仅用于升级兼容，避免旧稳定变量在升级时被隐式丢弃 ----
@@ -202,9 +203,14 @@ persistent actor MotokoShowcase { // 定义持久化 actor，保证变量跨升�
 
     let keyId = buildVetKeyId(keyName); // 构造 key_id 参数。
     let labelBlob = contextBlob(contextLabel); // 构造 context 参数。
+    let deriveCycles : Nat = 26_153_846_153; // 定义本次 vetkd_derive_key 调用需要附加的 cycles。
+    let ic00Update : actor { // 定义仅用于本次调用的 management actor（update 版本签名）。
+      vetkd_derive_key : shared VetKDDeriveKeyArgs -> async VetKDDeriveKeyResult; // 使用 shared（非 query）以允许附加 cycles。
+    } = actor ("aaaaa-aa"); // 绑定管理 canister 主体。
 
     try { // 开始捕获系统调用异常。
-      let result = await ic00.vetkd_derive_key({ // 调用管理 canister 的 vetkd_derive_key。
+      ExperimentalCycles.add<system>(deriveCycles); // 在本次跨 canister 调用前附加 vetkd_derive_key 需要的 cycles。
+      let result = await ic00Update.vetkd_derive_key({ // 调用 management actor 的 update 版 vetkd_derive_key。
         context = labelBlob; // 传入 context blob。
         input = Principal.toBlob(caller); // 绑定 caller 作为派生输入。
         key_id = keyId; // 传入 key_id。

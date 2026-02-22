@@ -1,26 +1,38 @@
 import { useEffect, useMemo, useState } from 'react';
 import { backend as defaultBackend, canisterId, createActor } from 'declarations/backend';
 import { Principal } from '@dfinity/principal';
-import { AuthClient } from '@dfinity/auth-client';
+import { AuthClient, IdbStorage, KEY_STORAGE_DELEGATION, KEY_STORAGE_KEY, LocalStorage } from '@dfinity/auth-client';
 import * as VetKeys from '@dfinity/vetkeys';
 
 const DEFAULT_KEY_NAME = 'test_key_1';
 const DEFAULT_CONTEXT = 'motoko-show';
-const DEFAULT_MESSAGE = 'hello vetkeys';
+const AUTH_STORAGE_IV_KEY = 'iv';
+const CIPHER_PACKAGE_MAGIC = Uint8Array.from([0x56, 0x4b, 0x44, 0x01]);
 
 const isLocalhostEnvironment = () => {
   const hostname = typeof window === 'undefined' ? '' : window.location.hostname;
   return hostname === 'localhost' || hostname === '127.0.0.1' || hostname.endsWith('.localhost');
 };
 
+const isSafariBrowser = () => {
+  if (typeof navigator === 'undefined') {
+    return false;
+  }
+  const userAgent = navigator.userAgent;
+  return /Safari/i.test(userAgent) && !/Chrome|Chromium|Edg|OPR/i.test(userAgent);
+};
+
 const getIdentityProviderConfig = () => {
   const dfxNetwork = (process.env.DFX_NETWORK ?? '').toLowerCase();
   const iiCanisterId = process.env.CANISTER_ID_INTERNET_IDENTITY;
   if (dfxNetwork === 'ic') {
-    return { ok: true, identityProvider: 'https://identity.ic0.app/#authorize' };
+    return { ok: true, identityProviders: ['https://identity.ic0.app/#authorize'] };
   }
   if (iiCanisterId) {
-    return { ok: true, identityProvider: `http://${iiCanisterId}.localhost:4943/#authorize` };
+    const subdomainUrl = `http://${iiCanisterId}.localhost:4943/#authorize`;
+    const localhostUrl = `http://localhost:4943/?canisterId=${iiCanisterId}#authorize`;
+    const identityProviders = isSafariBrowser() ? [localhostUrl, subdomainUrl] : [subdomainUrl, localhostUrl];
+    return { ok: true, identityProviders };
   }
   if (dfxNetwork && dfxNetwork !== 'ic') {
     return { ok: false, reason: 'missing_local_ii' };
@@ -28,7 +40,46 @@ const getIdentityProviderConfig = () => {
   if (isLocalhostEnvironment()) {
     return { ok: false, reason: 'missing_local_ii' };
   }
-  return { ok: true, identityProvider: 'https://identity.ic0.app/#authorize' };
+  return { ok: true, identityProviders: ['https://identity.ic0.app/#authorize'] };
+};
+
+const clearAuthClientStorage = async () => {
+  const localStorageBackend = new LocalStorage();
+  const indexedDbStorageBackend = new IdbStorage();
+
+  await Promise.all([
+    localStorageBackend.remove(KEY_STORAGE_KEY).catch(() => undefined),
+    localStorageBackend.remove(KEY_STORAGE_DELEGATION).catch(() => undefined),
+    localStorageBackend.remove(AUTH_STORAGE_IV_KEY).catch(() => undefined),
+    indexedDbStorageBackend.remove(KEY_STORAGE_KEY).catch(() => undefined),
+    indexedDbStorageBackend.remove(KEY_STORAGE_DELEGATION).catch(() => undefined),
+    indexedDbStorageBackend.remove(AUTH_STORAGE_IV_KEY).catch(() => undefined)
+  ]);
+
+  if (typeof window !== 'undefined') {
+    window.sessionStorage.removeItem(`ic-${KEY_STORAGE_KEY}`);
+    window.sessionStorage.removeItem(`ic-${KEY_STORAGE_DELEGATION}`);
+    window.sessionStorage.removeItem(`ic-${AUTH_STORAGE_IV_KEY}`);
+  }
+};
+
+const loginWithIdentityProviderFallback = async (client, identityProviders) => {
+  let lastError;
+  for (const identityProvider of identityProviders) {
+    try {
+      await new Promise((resolve, reject) => {
+        client.login({
+          identityProvider,
+          onSuccess: resolve,
+          onError: (error) => reject(error)
+        });
+      });
+      return;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw lastError ?? new Error('identity login failed');
 };
 
 const parseHexToBytes = (hexRaw) => {
@@ -48,6 +99,61 @@ const parseHexToBytes = (hexRaw) => {
     bytes.push(Number.parseInt(clean.slice(i, i + 2), 16));
   }
   return { ok: true, bytes };
+};
+
+const bytesEqual = (left, right) =>
+  left.length === right.length && left.every((value, index) => value === right[index]);
+
+const concatBytes = (...chunks) => {
+  const totalLength = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+  const merged = new Uint8Array(totalLength);
+  let offset = 0;
+  for (const chunk of chunks) {
+    merged.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return merged;
+};
+
+const encodeCipherPackage = ({ recipientBytes, derivedPublicKeyBytes, ciphertextBytes }) => {
+  if (recipientBytes.length > 255) {
+    throw new Error('recipient_too_long');
+  }
+  if (derivedPublicKeyBytes.length > 65535) {
+    throw new Error('dpk_too_long');
+  }
+  const dpkLength = derivedPublicKeyBytes.length;
+  const header = Uint8Array.from([
+    ...CIPHER_PACKAGE_MAGIC,
+    recipientBytes.length,
+    (dpkLength >> 8) & 0xff,
+    dpkLength & 0xff
+  ]);
+  return concatBytes(header, recipientBytes, derivedPublicKeyBytes, ciphertextBytes);
+};
+
+const decodeCipherPackage = (bytes) => {
+  if (bytes.length < 7 || !bytesEqual(bytes.subarray(0, 4), CIPHER_PACKAGE_MAGIC)) {
+    return { ok: true, packaged: false, ciphertextBytes: Uint8Array.from(bytes) };
+  }
+  const recipientLength = bytes[4];
+  const dpkLength = (bytes[5] << 8) | bytes[6];
+  const payloadOffset = 7;
+  const minimumLength = payloadOffset + recipientLength + dpkLength + 1;
+  if (bytes.length < minimumLength) {
+    return { ok: false, error: 'invalid_package' };
+  }
+  const recipientStart = payloadOffset;
+  const recipientEnd = recipientStart + recipientLength;
+  const dpkStart = recipientEnd;
+  const dpkEnd = dpkStart + dpkLength;
+  return {
+    ok: true,
+    packaged: true,
+    recipientBytes: Uint8Array.from(bytes.subarray(recipientStart, recipientEnd)),
+    derivedPublicKeyBytes: Uint8Array.from(bytes.subarray(dpkStart, dpkEnd)),
+    ciphertextBytes: Uint8Array.from(bytes.subarray(dpkEnd))
+  };
 };
 
 const parseTextResult = (result) => {
@@ -77,6 +183,7 @@ const messages = {
     loginTitle: 'Identity 登录',
     loginHint: '根据环境自动选择 II：ic 使用生产 II，其他网络使用本地 II。',
     loginBtn: 'Identity 登录',
+    switchLoginBtn: '切换账号登录',
     logoutBtn: '退出登录',
     principalLabel: '当前 Principal',
     loginDone: '登录成功',
@@ -86,6 +193,7 @@ const messages = {
     homeTitle: '功能入口',
     homeHint: '点击任意功能，进入独立全屏操作界面',
     backHome: '返回主页',
+    featureTipTitle: '功能提示',
     featurePublicKeyTitle: '读取 VetKD 公钥',
     featurePublicKeyDesc: '调用 vetkd_public_key，读取 key + context 的派生公钥。',
     featurePublicKeyAction: '执行：读取公钥',
@@ -109,24 +217,19 @@ const messages = {
     homeAtoBDecryptCard: 'B 侧：解密',
     homeAtoBCiphertextOut: 'A 生成的密文',
     homeAtoBCiphertextIn: 'B 输入密文',
+    homeAtoBCiphertextBelow: '当前用于解密的密文',
     homeAtoBOut: 'B 解密后看到',
     homeAtoBInvalidPrincipal: 'B principal 格式无效',
     homeAtoBCiphertextFormatError: '密文格式错误',
     homeAtoBIdentityMismatch: '当前登录身份不是密文目标 B',
+    homeAtoBDecryptPermissionError: '解密失败：当前登录账号不是密文接收者，或密文与当前身份不匹配',
+    homeAtoBLegacyCiphertext: '当前密文是旧版本格式，请让发送方在当前版本重新加密后再解密',
+    homeAtoBRecipientMismatchPrefix: '密文目标账号与当前登录账号不一致',
+    homeAtoBCallerMismatch: '当前页面显示身份与后端实际调用身份不一致，请先点击“切换账号登录”后重试',
+    homeAtoBReplicaMismatch: '密文与当前本地链环境不匹配（可能已重启/重装本地网络），请让发送方重新加密',
     homeAtoBNeedLogin: '请先登录身份再执行',
     homeAtoBEmptyPlaintext: '发送明文不能为空',
     homeAtoBUnsupportedCipher: '当前 VetKeys 版本不支持密文序列化/反序列化',
-    homeSignTitle: 'A 发文字，B 按 A principal 验签',
-    homeSignDesc: 'A 用 Ed25519 私钥签名；B 用公钥验签，并验证公钥推导 principal 与 A 的 principal 一致。',
-    homeSignAction: 'A 签名并让 B 验签',
-    homeSignPayload: 'A 广播：版本 1.2.6 已冻结',
-    homeSignPrincipalOut: 'A Principal',
-    homeSignPublicKeyOut: 'A 公钥(hex)',
-    homeSignSignatureOut: 'A 签名(hex)',
-    homeSignVerifyOut: 'B 验签结果',
-    homeSignVerifyPass: '通过（签名有效且 principal 匹配）',
-    homeSignVerifyFail: '失败（签名无效或 principal 不匹配）',
-    homeSignUnsupported: '当前环境不支持 WebCrypto Ed25519',
     publicKeyOut: 'VetKD 公钥(hex)',
     encryptedKeyOut: '加密密钥(hex)',
     callerInputOut: 'Caller Input(hex)',
@@ -152,6 +255,7 @@ const messages = {
     loginTitle: 'Identity Login',
     loginHint: 'Identity provider is selected by environment: ic uses production II, others use local II.',
     loginBtn: 'Identity Login',
+    switchLoginBtn: 'Switch Account',
     logoutBtn: 'Logout',
     principalLabel: 'Current Principal',
     loginDone: 'Login success',
@@ -161,6 +265,7 @@ const messages = {
     homeTitle: 'Feature Entry',
     homeHint: 'Click any feature to open its full-screen operation page',
     backHome: 'Back to Home',
+    featureTipTitle: 'Feature Tip',
     featurePublicKeyTitle: 'Read VetKD Public Key',
     featurePublicKeyDesc: 'Call vetkd_public_key and read the derived public key for key + context.',
     featurePublicKeyAction: 'Run: Read Public Key',
@@ -184,24 +289,19 @@ const messages = {
     homeAtoBDecryptCard: 'B Side: Decrypt',
     homeAtoBCiphertextOut: 'Ciphertext produced by A',
     homeAtoBCiphertextIn: 'Ciphertext input by B',
+    homeAtoBCiphertextBelow: 'Ciphertext used for decryption',
     homeAtoBOut: 'B decrypted text',
     homeAtoBInvalidPrincipal: 'Invalid B principal format',
     homeAtoBCiphertextFormatError: 'Invalid ciphertext format',
     homeAtoBIdentityMismatch: 'Current login identity is not ciphertext target B',
+    homeAtoBDecryptPermissionError: 'Decryption failed: current login is not the intended recipient or ciphertext does not match this identity',
+    homeAtoBLegacyCiphertext: 'This ciphertext was generated by an old format. Ask sender to re-encrypt with current app version',
+    homeAtoBRecipientMismatchPrefix: 'Ciphertext recipient does not match current login principal',
+    homeAtoBCallerMismatch: 'Displayed principal and backend caller identity are different. Click "Switch Account" and try again',
+    homeAtoBReplicaMismatch: 'Ciphertext does not match current local chain environment (local network was likely reset). Ask sender to re-encrypt',
     homeAtoBNeedLogin: 'Please login before executing this flow',
     homeAtoBEmptyPlaintext: 'Plaintext must not be empty',
     homeAtoBUnsupportedCipher: 'Current VetKeys version does not support ciphertext serialization/deserialization',
-    homeSignTitle: 'A Sends Text, B Verifies By A Principal',
-    homeSignDesc: 'A signs with Ed25519 private key; B verifies signature and checks derived principal matches A principal.',
-    homeSignAction: 'A Sign, B Verify',
-    homeSignPayload: 'A broadcast: release 1.2.6 is frozen',
-    homeSignPrincipalOut: 'A Principal',
-    homeSignPublicKeyOut: 'A Public Key (hex)',
-    homeSignSignatureOut: 'A Signature (hex)',
-    homeSignVerifyOut: 'B Verification',
-    homeSignVerifyPass: 'PASS (signature valid and principal matched)',
-    homeSignVerifyFail: 'FAIL (invalid signature or principal mismatch)',
-    homeSignUnsupported: 'WebCrypto Ed25519 is not supported in this environment',
     publicKeyOut: 'VetKD Public Key (hex)',
     encryptedKeyOut: 'Encrypted Key (hex)',
     callerInputOut: 'Caller Input (hex)',
@@ -225,31 +325,21 @@ function App() {
   const [currentPrincipalText, setCurrentPrincipalText] = useState(Principal.anonymous().toText());
   const [isLoggedIn, setIsLoggedIn] = useState(false);
 
-  const [publicKeyHex, setPublicKeyHex] = useState('');
-  const [encryptedKeyHex, setEncryptedKeyHex] = useState('');
   const [aToBRecipientPrincipal, setAtoBRecipientPrincipal] = useState('');
   const [aToBPlaintext, setAtoBPlaintext] = useState('');
   const [aToBCiphertextOut, setAtoBCiphertextOut] = useState('');
   const [aToBCiphertextIn, setAtoBCiphertextIn] = useState('');
-  const [aToBOutput, setAtoBOutput] = useState('');
-  const [signedByAPrincipal, setSignedByAPrincipal] = useState('');
-  const [signedByAPublicKey, setSignedByAPublicKey] = useState('');
-  const [signedByASignature, setSignedByASignature] = useState('');
-  const [verifyByBResult, setVerifyByBResult] = useState('');
+  const [aToBDecryptedText, setAtoBDecryptedText] = useState('');
 
   const t = messages[lang];
   const actorReady = Boolean(backendActor);
+  const statusText = status || t.idle;
+  const featureTipType = statusText.startsWith(`${t.actionFailed}:`) ? 'error' : busy ? 'running' : 'info';
 
   useEffect(() => {
     document.documentElement.lang = lang === 'zh' ? 'zh-CN' : 'en';
     document.title = t.pageTitle;
   }, [lang, t.pageTitle]);
-
-  useEffect(() => {
-    if (!aToBPlaintext) {
-      setAtoBPlaintext(t.homeAtoBPayload);
-    }
-  }, [aToBPlaintext, t.homeAtoBPayload]);
 
   const switchIdentity = (identity) => {
     if (!canisterId) {
@@ -312,20 +402,11 @@ function App() {
   }, [actorReady, t.idle, t.backendMissing]);
 
   const featureItems = useMemo(
-    () => [
-      { id: 'aToB', title: t.homeAtoBTitle, desc: t.homeAtoBDesc },
-      { id: 'aSignVerify', title: t.homeSignTitle, desc: t.homeSignDesc }
-    ],
-    [
-      t.homeAtoBTitle,
-      t.homeAtoBDesc,
-      t.homeSignTitle,
-      t.homeSignDesc
-    ]
+    () => [{ id: 'aToB', title: t.homeAtoBTitle, desc: t.homeAtoBDesc }],
+    [t.homeAtoBTitle, t.homeAtoBDesc]
   );
 
   const activeItem = featureItems.find((item) => item.id === activeFeature) ?? null;
-  const activeMessageText = activeFeature === 'aToB' ? t.homeAtoBPayload : activeFeature === 'aSignVerify' ? t.homeSignPayload : DEFAULT_MESSAGE;
 
   const runAction = async (actionKey, action) => {
     if (!actorReady) {
@@ -376,19 +457,44 @@ function App() {
         setAuthClient(client);
       }
 
-      const { identityProvider } = providerConfig;
       try {
-        await new Promise((resolve, reject) => {
-          client.login({
-            identityProvider,
-            onSuccess: resolve,
-            onError: (error) => reject(error)
-          });
-        });
+        await loginWithIdentityProviderFallback(client, providerConfig.identityProviders);
       } catch (error) {
-        setStatus(`${t.actionFailed}: ${t.loginUnsupported}`);
+        setStatus(
+          `${t.actionFailed}: ${t.loginUnsupported}${error instanceof Error && error.message ? ` (${error.message})` : ''}`
+        );
         return;
       }
+
+      const identity = client.getIdentity();
+      switchIdentity(identity);
+      setStatus(`${t.loginDone}: ${identity.getPrincipal().toText()}`);
+    });
+  };
+
+  const handleSwitchAccountLogin = async () => {
+    await runLocalAction('switchLogin', async () => {
+      const providerConfig = getIdentityProviderConfig();
+      if (!providerConfig.ok) {
+        setStatus(`${t.actionFailed}: ${t.loginProviderMissing}`);
+        return;
+      }
+
+      let client = authClient;
+      if (!client) {
+        client = await AuthClient.create();
+        setAuthClient(client);
+      }
+
+      await client.logout();
+      switchIdentity(null);
+
+      // 强制清理旧 session key 与 delegation，避免切换账号后仍复用旧 principal。
+      await clearAuthClientStorage();
+      client = await AuthClient.create();
+      setAuthClient(client);
+
+      await loginWithIdentityProviderFallback(client, providerConfig.identityProviders);
 
       const identity = client.getIdentity();
       switchIdentity(identity);
@@ -401,6 +507,8 @@ function App() {
       if (authClient) {
         await authClient.logout();
       }
+      await clearAuthClientStorage();
+      setAuthClient(null);
       switchIdentity(null);
       setStatus(t.logoutDone);
     });
@@ -489,22 +597,17 @@ function App() {
       const recipientIdentity = IbeIdentity.fromBytes(recipientIdentityBytes);
       const payload = new TextEncoder().encode(plaintext);
       const ciphertext = IbeCiphertext.encrypt(derivedPublicKey, recipientIdentity, payload, IbeSeed.random());
-      const ciphertextHex = bytesToHex(serializeIbeCiphertext(ciphertext));
+      const ciphertextBytes = serializeIbeCiphertext(ciphertext);
+      const packagedCiphertextBytes = encodeCipherPackage({
+        recipientBytes: recipientIdentityBytes,
+        derivedPublicKeyBytes: Uint8Array.from(publicKeyBytes.bytes),
+        ciphertextBytes
+      });
+      const ciphertextHex = bytesToHex(packagedCiphertextBytes);
 
-      const envelope = {
-        version: 1,
-        keyName: DEFAULT_KEY_NAME,
-        context: DEFAULT_CONTEXT,
-        recipientPrincipal: recipientPrincipal.toText(),
-        derivedPublicKeyHex: publicKeyResult.value,
-        ciphertextHex
-      };
-
-      const envelopeText = JSON.stringify(envelope);
-      setPublicKeyHex(publicKeyResult.value);
-      setAtoBCiphertextOut(envelopeText);
-      setAtoBCiphertextIn(envelopeText);
-      setAtoBOutput('');
+      setAtoBCiphertextOut(ciphertextHex);
+      setAtoBCiphertextIn(ciphertextHex);
+      setAtoBDecryptedText('');
       setStatus(t.homeAtoBEncryptAction);
     });
   };
@@ -514,28 +617,25 @@ function App() {
       if (!ensureLoggedIn()) {
         return;
       }
+      setAtoBDecryptedText('');
 
-      let envelope;
-      try {
-        envelope = JSON.parse(aToBCiphertextIn.trim());
-      } catch (_) {
+      const ciphertextHex = aToBCiphertextIn.trim();
+      if (!ciphertextHex) {
         setStatus(`${t.actionFailed}: ${t.homeAtoBCiphertextFormatError}`);
         return;
       }
-
-      if (
-        !envelope ||
-        typeof envelope !== 'object' ||
-        typeof envelope.ciphertextHex !== 'string' ||
-        typeof envelope.derivedPublicKeyHex !== 'string' ||
-        typeof envelope.recipientPrincipal !== 'string'
-      ) {
+      const ciphertextInputBytes = parseHexToBytes(ciphertextHex);
+      if (!ciphertextInputBytes.ok) {
         setStatus(`${t.actionFailed}: ${t.homeAtoBCiphertextFormatError}`);
         return;
       }
-
-      if (envelope.recipientPrincipal !== currentPrincipalText) {
-        setStatus(`${t.actionFailed}: ${t.homeAtoBIdentityMismatch}`);
+      const decodedPackage = decodeCipherPackage(Uint8Array.from(ciphertextInputBytes.bytes));
+      if (!decodedPackage.ok) {
+        setStatus(`${t.actionFailed}: ${t.homeAtoBCiphertextFormatError}`);
+        return;
+      }
+      if (!decodedPackage.packaged) {
+        setStatus(`${t.actionFailed}: ${t.homeAtoBLegacyCiphertext}`);
         return;
       }
 
@@ -552,112 +652,91 @@ function App() {
 
       const transportSecretKey = TransportSecretKey.random();
       const transportPublicKeyBytes = Array.from(transportSecretKey.publicKeyBytes());
-      const keyName = typeof envelope.keyName === 'string' && envelope.keyName ? envelope.keyName : DEFAULT_KEY_NAME;
-      const context = typeof envelope.context === 'string' && envelope.context ? envelope.context : DEFAULT_CONTEXT;
+      const keyName = DEFAULT_KEY_NAME;
+      const context = DEFAULT_CONTEXT;
       const deriveResult = parseTextResult(await backendActor.vetkdDeriveKeyExample(transportPublicKeyBytes, keyName, context));
       if (!deriveResult.ok) {
         setStatus(`${t.actionFailed}: ${deriveResult.error}`);
         return;
       }
 
+      const publicKeyResult = parseTextResult(await backendActor.vetkdPublicKeyExample(keyName, context));
+      if (!publicKeyResult.ok) {
+        setStatus(`${t.actionFailed}: ${publicKeyResult.error}`);
+        return;
+      }
+
       const encryptedKeyBytes = parseHexToBytes(deriveResult.value);
-      const derivedPublicKeyBytes = parseHexToBytes(envelope.derivedPublicKeyHex);
-      const ciphertextBytes = parseHexToBytes(envelope.ciphertextHex);
+      const derivedPublicKeyBytes = parseHexToBytes(publicKeyResult.value);
+      const ciphertextBytes = parseHexToBytes(ciphertextHex);
       if (!encryptedKeyBytes.ok || !derivedPublicKeyBytes.ok || !ciphertextBytes.ok) {
         setStatus(`${t.actionFailed}: ${t.homeAtoBCiphertextFormatError}`);
         return;
       }
 
-      const encryptedVetKey = new EncryptedVetKey(Uint8Array.from(encryptedKeyBytes.bytes));
-      const derivedPublicKey = DerivedPublicKey.deserialize(Uint8Array.from(derivedPublicKeyBytes.bytes));
-      const identityBytes = Principal.fromText(currentPrincipalText).toUint8Array();
-      const vetKey = encryptedVetKey.decryptAndVerify(transportSecretKey, derivedPublicKey, identityBytes);
-      const ciphertext = deserializeIbeCiphertext(IbeCiphertext, Uint8Array.from(ciphertextBytes.bytes));
-      const decrypted = ciphertext.decrypt(vetKey);
-
-      setPublicKeyHex(envelope.derivedPublicKeyHex);
-      setEncryptedKeyHex(deriveResult.value);
-      setAtoBOutput(new TextDecoder().decode(decrypted));
-      setStatus(t.homeAtoBDecryptAction);
-    });
-  };
-
-  const handleSignAndVerifyHomeAction = async () => {
-    await runLocalAction('aSignVerify', async () => {
-      if (!globalThis.crypto?.subtle) {
-        setStatus(`${t.actionFailed}: ${t.homeSignUnsupported}`);
+      const callerInputHex = await backendActor.vetkdCallerInputHex();
+      const callerInputParsed = parseHexToBytes(callerInputHex);
+      if (!callerInputParsed.ok) {
+        setStatus(`${t.actionFailed}: ${t.homeAtoBCiphertextFormatError}`);
         return;
       }
+      const callerInputBytes = Uint8Array.from(callerInputParsed.bytes);
 
-      let keyPair;
+      const displayPrincipalBytes = Principal.fromText(currentPrincipalText).toUint8Array();
+      const displayPrincipalHex = bytesToHex(displayPrincipalBytes);
+      if (displayPrincipalHex !== callerInputHex) {
+        setStatus(`${t.actionFailed}: ${t.homeAtoBCallerMismatch}`);
+        return;
+      }
+      if (!bytesEqual(callerInputBytes, decodedPackage.recipientBytes)) {
+        let recipientText = '-';
+        try {
+          recipientText = Principal.fromUint8Array(decodedPackage.recipientBytes).toText();
+        } catch (_) {
+          recipientText = bytesToHex(decodedPackage.recipientBytes);
+        }
+        setStatus(
+          `${t.actionFailed}: ${t.homeAtoBRecipientMismatchPrefix} (target=${recipientText}, current=${currentPrincipalText})`
+        );
+        return;
+      }
+      let recipientTextForStatus = currentPrincipalText;
       try {
-        keyPair = await globalThis.crypto.subtle.generateKey({ name: 'Ed25519' }, true, ['sign', 'verify']);
+        recipientTextForStatus = Principal.fromUint8Array(decodedPackage.recipientBytes).toText();
       } catch (_) {
-        setStatus(`${t.actionFailed}: ${t.homeSignUnsupported}`);
-        return;
+        recipientTextForStatus = bytesToHex(decodedPackage.recipientBytes);
       }
 
-      const messageBytes = new TextEncoder().encode(t.homeSignPayload);
-      const publicKeyBytes = new Uint8Array(await globalThis.crypto.subtle.exportKey('raw', keyPair.publicKey));
-      const signatureBytes = new Uint8Array(await globalThis.crypto.subtle.sign('Ed25519', keyPair.privateKey, messageBytes));
-
-      const principalA = Principal.selfAuthenticating(publicKeyBytes).toText();
-      const publicKeyHex = bytesToHex(publicKeyBytes);
-      const signatureHex = bytesToHex(signatureBytes);
-
-      const parsedPublic = parseHexToBytes(publicKeyHex);
-      const parsedSignature = parseHexToBytes(signatureHex);
-      if (!parsedPublic.ok || !parsedSignature.ok) {
-        setStatus(`${t.actionFailed}: invalid hex data`);
-        return;
+      try {
+        const encryptedVetKey = EncryptedVetKey.deserialize(Uint8Array.from(encryptedKeyBytes.bytes));
+        if (!bytesEqual(Uint8Array.from(derivedPublicKeyBytes.bytes), decodedPackage.derivedPublicKeyBytes)) {
+          setStatus(`${t.actionFailed}: ${t.homeAtoBReplicaMismatch}`);
+          return;
+        }
+        const effectiveDpkBytes = decodedPackage.derivedPublicKeyBytes;
+        const effectiveCiphertextBytes = decodedPackage.ciphertextBytes;
+        const derivedPublicKey = DerivedPublicKey.deserialize(effectiveDpkBytes);
+        const identityBytes = callerInputBytes;
+        const vetKey = encryptedVetKey.decryptAndVerify(transportSecretKey, derivedPublicKey, identityBytes);
+        const ciphertext = deserializeIbeCiphertext(IbeCiphertext, effectiveCiphertextBytes);
+        const decrypted = ciphertext.decrypt(vetKey);
+        const decryptedText = new TextDecoder().decode(decrypted);
+        setAtoBDecryptedText(decryptedText);
+        setStatus(`${t.homeAtoBDecryptAction}: ${t.homeAtoBOut} = ${decryptedText}`);
+      } catch (error) {
+        const details = error instanceof Error ? error.message : String(error);
+        const normalized = details.toLowerCase();
+        if (normalized.includes('cannot mix bigint') || normalized.includes('decrypt') || normalized.includes('verify')) {
+          setStatus(
+            `${t.actionFailed}: ${t.homeAtoBDecryptPermissionError} (target=${recipientTextForStatus}, current=${currentPrincipalText})`
+          );
+          return;
+        }
+        setStatus(
+          `${t.actionFailed}: ${t.homeAtoBDecryptPermissionError} (target=${recipientTextForStatus}, current=${currentPrincipalText})`
+        );
       }
-
-      const receivedPublicKey = Uint8Array.from(parsedPublic.bytes);
-      const receivedSignature = Uint8Array.from(parsedSignature.bytes);
-      const derivedPrincipalByB = Principal.selfAuthenticating(receivedPublicKey).toText();
-      const principalMatched = derivedPrincipalByB === principalA;
-
-      const verifyKey = await globalThis.crypto.subtle.importKey('raw', receivedPublicKey, { name: 'Ed25519' }, true, ['verify']);
-      const signatureValid = await globalThis.crypto.subtle.verify('Ed25519', verifyKey, receivedSignature, messageBytes);
-
-      setSignedByAPrincipal(principalA);
-      setSignedByAPublicKey(publicKeyHex);
-      setSignedByASignature(signatureHex);
-      setVerifyByBResult(signatureValid && principalMatched ? t.homeSignVerifyPass : t.homeSignVerifyFail);
-      setStatus(t.homeSignAction);
     });
-  };
-
-  const currentAction = (() => {
-    if (activeFeature === 'aSignVerify') {
-      return { id: 'aSignVerify', label: t.homeSignAction, run: handleSignAndVerifyHomeAction };
-    }
-    return null;
-  })();
-
-  const renderFeatureResult = () => {
-    if (activeFeature === 'aSignVerify') {
-      return (
-        <>
-          <p className="output-line">
-            {t.messageLabel}: <strong>{t.homeSignPayload}</strong>
-          </p>
-          <p className="output-line">
-            {t.homeSignPrincipalOut}: <strong>{signedByAPrincipal || '-'}</strong>
-          </p>
-          <p className="output-line">
-            {t.homeSignPublicKeyOut}: <strong>{signedByAPublicKey || '-'}</strong>
-          </p>
-          <p className="output-line">
-            {t.homeSignSignatureOut}: <strong>{signedByASignature || '-'}</strong>
-          </p>
-          <p className="output-line">
-            {t.homeSignVerifyOut}: <strong>{verifyByBResult || '-'}</strong>
-          </p>
-        </>
-      );
-    }
-    return null;
   };
 
   return (
@@ -683,7 +762,7 @@ function App() {
 
       <section className="status-ribbon">
         <div className={`backend-flag ${actorReady ? 'ready' : 'offline'}`}>{actorReady ? t.backendReady : t.backendMissing}</div>
-        <p className="status-line">{status || t.idle}</p>
+        <p className="status-line">{statusText}</p>
       </section>
 
       <section className="login-ribbon">
@@ -694,6 +773,14 @@ function App() {
         <div className="login-actions">
           <button className="login-btn-main" disabled={busy === 'login'} onClick={handleLogin} type="button">
             {busy === 'login' ? t.running : t.loginBtn}
+          </button>
+          <button
+            className="switch-login-btn-main"
+            disabled={busy === 'switchLogin'}
+            onClick={handleSwitchAccountLogin}
+            type="button"
+          >
+            {busy === 'switchLogin' ? t.running : t.switchLoginBtn}
           </button>
           <button className="logout-btn-main" disabled={busy === 'logout'} onClick={handleLogout} type="button">
             {busy === 'logout' ? t.running : t.logoutBtn}
@@ -719,7 +806,7 @@ function App() {
         </div>
       </section>
 
-      {activeItem && (currentAction || activeFeature === 'aToB') ? (
+      {activeItem && activeFeature === 'aToB' ? (
         <div className="feature-overlay" role="dialog" aria-modal="true">
           <div className="feature-screen">
             <header className="overlay-top">
@@ -739,93 +826,67 @@ function App() {
             <section className="feature-content">
               <h2 className="feature-title">{activeItem.title}</h2>
               <p className="feature-desc">{activeItem.desc}</p>
-              {activeFeature === 'aToB' ? (
-                <>
-                  <p className="feature-desc">{t.moduleHint}</p>
-                  <p className="feature-desc">
-                    {t.principalLabel}: <strong>{currentPrincipalText}</strong> {isLoggedIn ? '(login)' : '(anonymous)'}
-                  </p>
-                  <div className="a2b-grid">
-                    <article className="a2b-card">
-                      <h3 className="a2b-card-title">{t.homeAtoBEncryptCard}</h3>
-                      <label className="field" htmlFor="aToBRecipientPrincipal">
-                        <span>{t.homeAtoBRecipient}</span>
-                        <input
-                          id="aToBRecipientPrincipal"
-                          className="text-input"
-                          value={aToBRecipientPrincipal}
-                          onChange={(event) => setAtoBRecipientPrincipal(event.target.value)}
-                        />
-                      </label>
-                      <label className="field" htmlFor="aToBPlaintext">
-                        <span>{t.homeAtoBPlaintext}</span>
-                        <textarea
-                          id="aToBPlaintext"
-                          className="text-area"
-                          value={aToBPlaintext}
-                          onChange={(event) => setAtoBPlaintext(event.target.value)}
-                        />
-                      </label>
-                      <button className="action-btn" disabled={busy === 'aEncrypt'} onClick={handleAEncryptForB} type="button">
-                        {busy === 'aEncrypt' ? t.running : t.homeAtoBEncryptAction}
-                      </button>
-                      <label className="field" htmlFor="aToBCiphertextOut">
-                        <span>{t.homeAtoBCiphertextOut}</span>
-                        <textarea id="aToBCiphertextOut" className="text-area" readOnly value={aToBCiphertextOut} />
-                      </label>
-                    </article>
+              <div className={`feature-tip ${featureTipType}`}>
+                <span className="feature-tip-title">{t.featureTipTitle}</span>
+                <span className="feature-tip-text">{busy ? t.running : statusText}</span>
+              </div>
+              <p className="feature-desc">{t.moduleHint}</p>
+              <p className="feature-desc">
+                {t.principalLabel}: <strong>{currentPrincipalText}</strong> {isLoggedIn ? '(login)' : '(anonymous)'}
+              </p>
+              <div className="a2b-grid">
+                <article className="a2b-card">
+                  <h3 className="a2b-card-title">{t.homeAtoBEncryptCard}</h3>
+                  <label className="field" htmlFor="aToBRecipientPrincipal">
+                    <span>{t.homeAtoBRecipient}</span>
+                    <input
+                      id="aToBRecipientPrincipal"
+                      className="text-input"
+                      value={aToBRecipientPrincipal}
+                      onChange={(event) => setAtoBRecipientPrincipal(event.target.value)}
+                    />
+                  </label>
+                  <label className="field" htmlFor="aToBPlaintext">
+                    <span>{t.homeAtoBPlaintext}</span>
+                    <textarea
+                      id="aToBPlaintext"
+                      className="text-area"
+                      value={aToBPlaintext}
+                      onChange={(event) => setAtoBPlaintext(event.target.value)}
+                    />
+                  </label>
+                  <button className="action-btn" disabled={busy === 'aEncrypt'} onClick={handleAEncryptForB} type="button">
+                    {busy === 'aEncrypt' ? t.running : t.homeAtoBEncryptAction}
+                  </button>
+                  <label className="field" htmlFor="aToBCiphertextOut">
+                    <span>{t.homeAtoBCiphertextOut}</span>
+                    <textarea id="aToBCiphertextOut" className="text-area text-area-cipher" readOnly value={aToBCiphertextOut} />
+                  </label>
+                </article>
 
-                    <article className="a2b-card">
-                      <h3 className="a2b-card-title">{t.homeAtoBDecryptCard}</h3>
-                      <label className="field" htmlFor="aToBCiphertextIn">
-                        <span>{t.homeAtoBCiphertextIn}</span>
-                        <textarea
-                          id="aToBCiphertextIn"
-                          className="text-area"
-                          value={aToBCiphertextIn}
-                          onChange={(event) => setAtoBCiphertextIn(event.target.value)}
-                        />
-                      </label>
-                      <button className="action-btn" disabled={busy === 'bDecrypt'} onClick={handleBDecryptCiphertext} type="button">
-                        {busy === 'bDecrypt' ? t.running : t.homeAtoBDecryptAction}
-                      </button>
-                      <p className="output-line">
-                        {t.homeAtoBOut}: <strong>{aToBOutput || '-'}</strong>
-                      </p>
-                      <p className="output-line">
-                        {t.publicKeyOut}: <strong>{publicKeyHex || '-'}</strong>
-                      </p>
-                      <p className="output-line">
-                        {t.encryptedKeyOut}: <strong>{encryptedKeyHex || '-'}</strong>
-                      </p>
-                    </article>
-                  </div>
-                </>
-              ) : (
-                <>
-                  <p className="feature-desc">{t.moduleHint}</p>
-
-                  <div className="feature-meta">
-                    <span className="meta-chip">
-                      {t.keyNameLabel}: {DEFAULT_KEY_NAME}
-                    </span>
-                    <span className="meta-chip">
-                      {t.contextLabel}: {DEFAULT_CONTEXT}
-                    </span>
-                    <span className="meta-chip">
-                      {t.messageLabel}: {activeMessageText}
-                    </span>
-                  </div>
-
-                  <div className="action-zone">
-                    <button className="action-btn" disabled={busy === currentAction.id} onClick={currentAction.run} type="button">
-                      {busy === currentAction.id ? t.running : currentAction.label}
-                    </button>
-                  </div>
-
-                  <section className="result-box">{renderFeatureResult()}</section>
-                </>
-              )}
+                <article className="a2b-card">
+                  <h3 className="a2b-card-title">{t.homeAtoBDecryptCard}</h3>
+                  <label className="field" htmlFor="aToBCiphertextIn">
+                    <span>{t.homeAtoBCiphertextIn}</span>
+                    <textarea
+                      id="aToBCiphertextIn"
+                      className="text-area text-area-cipher"
+                      value={aToBCiphertextIn}
+                      onChange={(event) => {
+                        setAtoBCiphertextIn(event.target.value);
+                        setAtoBDecryptedText('');
+                      }}
+                    />
+                  </label>
+                  <button className="action-btn" disabled={busy === 'bDecrypt'} onClick={handleBDecryptCiphertext} type="button">
+                    {busy === 'bDecrypt' ? t.running : t.homeAtoBDecryptAction}
+                  </button>
+                  <label className="field" htmlFor="aToBDecryptedText">
+                    <span>{t.homeAtoBOut}</span>
+                    <textarea id="aToBDecryptedText" className="text-area text-area-cipher" readOnly value={aToBDecryptedText} />
+                  </label>
+                </article>
+              </div>
             </section>
           </div>
         </div>
